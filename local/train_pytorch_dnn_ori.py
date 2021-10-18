@@ -17,16 +17,15 @@ import math
 import torch
 
 import torch.nn as nn
-# import horovod.torch as hvd
+import horovod.torch as hvd
 
 from utils.pytorch_data import KaldiArkDataset
 from utils import ze_utils
 from models.metrics import AddMarginProduct, ArcMarginProduct, SphereProduct
 from models.resnet2 import *
 
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-import torch.multiprocessing as mp
+
+APEX_AVAILABLE = False
 
 torch.backends.cudnn.benchmark = True
 
@@ -138,6 +137,7 @@ def get_args():
     parser.add_argument("--stage", type=int, default=-2,
                         help="Specifies the stage of the training to execution from.")
 
+    parser.add_argument('--use-apex', default=False, action='store_true', help='use APEX if available')
 
     parser.add_argument('--fix-margin-m', default=None, type=int,
                         help='fix margin m parameter after Nth iteration to its final value')
@@ -145,12 +145,20 @@ def get_args():
     parser.add_argument('--squeeze-excitation', default=False, action='store_true',
                         help='use squeeze excitation layers')
 
-    parser.add_argument("--gpu-num", default=1, type=int, help="Use GPU num for training.")
-    # parser.add_argument('--rank', default=0, action='', help='GPU device number eg. 0,1')
-
     args = parser.parse_args()
 
     args = process_args(args)
+
+    # apex
+
+    try:
+        if args.use_apex:
+            from apex import amp
+        else:
+            raise ModuleNotFoundError
+        APEX_AVAILABLE = True
+    except ModuleNotFoundError:
+        APEX_AVAILABLE = False
 
     return args
 
@@ -178,15 +186,9 @@ def process_args(args):
 
     return args
 
-def init_process(rank, world_size, backend='nccl'):
-    """ Initialize the distributed environment. """
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend, rank=rank, world_size=world_size)
-
 
 def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, criterion,
-                        device, log_interval, len_train_sampler, world_size, rank):
+                        device, log_interval, len_train_sampler):
     """ Called from train for one iteration of neural network training
 
     Selected args:
@@ -201,7 +203,6 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
     start_time = time.time()
     model.train()
     len_data_loader = len(data_loader)
-    # print(len_data_loader)
     total_gpu_waiting = 0
     batch_idx = 0
     try:
@@ -213,19 +214,27 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
                 ss = random.randint(0, args.frame_downsampling)
                 data = data[:, ss::args.frame_downsampling + 1, :]
 
-            data = data.to(rank)
-            target = target.to(rank)
+            data = data.to(torch.device(device=device))
+            target = target.to(torch.device(device=device))
             data = data.transpose(1, 2)
             optimizer.zero_grad()
             output = model(data)
             if args.metric == 'linear':
-                output = model.module.metric(output)
+                output = model.metric(output)
             else:
-                output = model.module.metric(output, target)
+                output = model.metric(output, target)
 
             loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
+
+            if APEX_AVAILABLE:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+                    optimizer.synchronize()
+                with optimizer.skip_synchronize():
+                    optimizer.step()
+            else:
+                loss.backward()
+                optimizer.step()
 
             loss = loss.item()
             iter_loss += loss
@@ -233,7 +242,7 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
             num_correct += predict.eq(target).sum().item()
             num_total += len(data)
             total_gpu_waiting += time.time() - gpu_waiting
-            if batch_idx > 0 and batch_idx % log_interval == 0 and rank == 0:
+            if batch_idx > 0 and batch_idx % log_interval == 0 and hvd.rank() == 0:
                 # use train_sampler to determine the number of examples in this worker's partition.
                 logger.info(f'Train Iter: {_iter} [{batch_idx * len(data)}/{len_train_sampler} '
                             f'({100.0 * batch_idx / len_data_loader:.0f}%)]  Loss: {loss:.6f}')
@@ -249,8 +258,8 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
     iter_loss /= len_data_loader
 
     # save the model and do logging in worker with rank zero
-    args.processed_archives += world_size
-    if rank == 0:
+    args.processed_archives += hvd.size()
+    if hvd.rank() == 0:
         logger.info(f'Iteration Loss: {iter_loss:.4f}  Accuracy: {acc * 100:.2f}%')
         logger.info(f'Elapsed time: {(time.time() - start_time) / 60.0:.2f} minutes '
                     f'and GPU waiting: {total_gpu_waiting / 60.0:.2f} minutes.')
@@ -270,7 +279,7 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
             file_name=new_model_path)
 
 
-def eval_network(model, data_loader, device, rank):
+def eval_network(model, data_loader, device):
     """ Called from train for one iteration of neural network training
 
     Selected args:
@@ -291,8 +300,8 @@ def eval_network(model, data_loader, device, rank):
         for batch_idx, (data, target) in enumerate(data_loader):
             gpu_waiting = time.time()
             target = target.long()
-            data = data.to(torch.device(device=rank))
-            target = target.to(torch.device(device=rank))
+            data = data.to(torch.device(device=device))
+            target = target.to(torch.device(device=device))
             data = data.transpose(1, 2)
             output, _, _ = model(data)
 
@@ -336,31 +345,32 @@ def _save_checkpoint(state, file_name, is_best=False):
         shutil.copyfile(file_name, 'model_best.pth')
 
 
-def train(rank, world_size, args):
+def train(args):
     """ The main function for training.
 
     Args:
         args: a Namespace object with the required parameters
             obtained from the function process_args()
     """
-    init_process(rank, world_size)
+
     egs_dir = args.egs_dir
     # initialize horovod
+    hvd.init()
 
     # verify egs dir and extract parameters
     [num_archives, egs_feat_dim, arks_num_egs] = ze_utils.verify_egs_dir(egs_dir)
     assert arks_num_egs > 0
 
-    # device = 'cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu'
-    # torch.cuda.set_device(hvd.local_rank())
+    device = 'cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu'
+    torch.cuda.set_device(hvd.local_rank())
 
-    # if rank == 0:
-        # logger.info(f'Device is: {device}')
+    if hvd.rank() == 0:
+        logger.info(f'Device is: {device}')
 
-    # num_jobs = hvd.size()
-    if rank == 0:
-        logger.info(f'Using {world_size} training jobs.')
-    if world_size > num_archives:
+    num_jobs = hvd.size()
+    if hvd.rank() == 0:
+        logger.info(f'Using {num_jobs} training jobs.')
+    if num_jobs > num_archives:
         raise ValueError('num_jobs cannot exceed the number of archives in the egs directory')
 
     init_model_path = args.model_init
@@ -382,7 +392,7 @@ def train(rank, world_size, args):
 
         # load the init model if exist. This is useful when loading from a pre-trained model
         if init_model_path is not None:
-            if rank == 0:
+            if hvd.rank() == 0:
                 logger.info(f'Loading the initial network from: {init_model_path}')
             checkpoint = torch.load(init_model_path, map_location='cpu')
             model.load_state_dict(checkpoint['state_dict'], strict=False)
@@ -392,49 +402,42 @@ def train(rank, world_size, args):
     model.add_module('metric', metric_fc)
 
     # move model to device before creating optimizer
+    model = model.to(torch.device(device=device))
 
-    # print(torch.cuda.get_device_name(0))
-    # print(torch.cuda.device_count())
-    # print(torch.cuda.current_device())
-    # print(torch.cuda.is_available())
-    model = model.cuda(rank)
-
-    ddp_model = DDP(model, device_ids=[rank])
-
-    parameters = ddp_model.parameters()
+    parameters = model.parameters()
 
     # scale learning rate by the number of GPUs.
     if args.optimizer == 'SGD':
-        main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate * world_size,
+        main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate * num_jobs,
                                          momentum=args.momentum, weight_decay=args.optimizer_weight_decay,
                                          nesterov=True)
     elif args.optimizer == 'Adam':
-        main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate * world_size,
+        main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate * num_jobs,
                                           weight_decay=args.optimizer_weight_decay)
     else:
         raise ValueError(f'Invalid optimizer {args.optimizer}.')
 
-    if rank == 0:
-        logger.info(str(ddp_model))
+    if hvd.rank() == 0:
+        logger.info(str(model))
         logger.info(str(main_optimizer))
 
     processed_archives = 0
-    if init_model_path is not None and rank == 0:
+    if init_model_path is not None and hvd.rank() == 0:
         logger.info(f'Saving the initial network to: {init_model_path}')
         _save_checkpoint({
             'processed_archives': processed_archives,
             'class_name': args.model,
             'frame_downsampling': args.frame_downsampling,
-            'state_dict': ddp_model.state_dict(),
+            'state_dict': model.state_dict(),
             'optimizer': main_optimizer.state_dict(),
         }, file_name=init_model_path)
 
     # save kaldi's files
-    if rank == 0:
+    if hvd.rank() == 0:
         with open(os.path.join(args.dir, 'models', 'model_info'), 'wt') as fid:
             fid.write(f'{args.model} {egs_feat_dim} {args.num_targets}{os.linesep}')
         with open(os.path.join(args.dir, 'models', 'config.txt'), 'wt') as fid:
-            fid.write(str(ddp_model))
+            fid.write(str(model))
         with open(os.path.join(args.dir, 'command.sh'), 'wt') as fid:
             fid.write(' '.join(sys.argv) + '\n')
         with open(os.path.join(args.dir, 'max_chunk_size'), 'wt') as fid:
@@ -455,22 +458,22 @@ def train(rank, world_size, args):
 
     if finished_iterations > 0:
         model_path = os.path.join(args.dir, 'models', f'raw_{finished_iterations}.pth')
-        if rank == 0:
+        if hvd.rank() == 0:
             logger.info('Loading model from ' + model_path)
 
         checkpoint = torch.load(model_path, map_location='cpu')
         processed_archives = checkpoint['processed_archives']
-        ddp_model.load_state_dict(checkpoint['state_dict'])
+        model.load_state_dict(checkpoint['state_dict'])
         main_optimizer.load_state_dict(checkpoint['optimizer'])
 
     # note: here minibatch is the size before
-    train_dataset = KaldiArkDataset(egs_dir=egs_dir, num_archives=num_archives, num_workers=world_size, rank=rank,
+    train_dataset = KaldiArkDataset(egs_dir=egs_dir, num_archives=num_archives, num_workers=num_jobs, rank=hvd.rank(),
                                     num_examples_in_each_ark=arks_num_egs, finished_iterations=finished_iterations,
                                     processed_archives=processed_archives, apply_cmn=args.apply_cmn)
 
     # use DistributedSampler to partition the training data.
     train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank)
+        train_dataset, num_replicas=num_jobs, rank=hvd.rank())
 
     kwargs = {'drop_last': False, 'pin_memory': False}
     train_loader = torch.utils.data.DataLoader(
@@ -479,19 +482,29 @@ def train(rank, world_size, args):
         sampler=train_sampler, 
         **kwargs)
 
-
+    # (optional) compression algorithm. TODO add better compression method
+    compression = hvd.Compression.fp16 if args.fp16_compression else hvd.Compression.none
+    #
     # wrap optimizer with DistributedOptimizer.
-    optimizer = main_optimizer
+    optimizer = hvd.DistributedOptimizer(main_optimizer, named_parameters=model.named_parameters(),
+                                         compression=compression)
 
-    # criterion = nn.CrossEntropyLoss().to(rank)
+    # broadcast parameters & optimizer state.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
     criterion = nn.CrossEntropyLoss()
     args.processed_archives = processed_archives
 
     # set num_iters so that as close as possible, we process the data
-    num_iters = int(args.num_epochs * num_archives * 1.0 / world_size)
-    num_archives_to_process = int(num_iters * world_size)
+    num_iters = int(args.num_epochs * num_archives * 1.0 / num_jobs)
+    num_archives_to_process = int(num_iters * num_jobs)
 
-    if rank == 0:
+    # initialize APEX
+    if APEX_AVAILABLE:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O1', loss_scale='dynamic')
+
+    if hvd.rank() == 0:
         logger.info(f'Training will run for {args.num_epochs} epochs = {num_iters} iterations')
 
     for _iter in range(finished_iterations, num_iters):
@@ -516,20 +529,19 @@ def train(rank, world_size, args):
                     else:
                         num_archives_to_process_margin_m = num_archives_to_process - (num_archives_to_process / args.num_epochs) * (args.num_epochs - args.fix_margin_m)
                 else:
-                    num_archives_to_process_margin_m = num_archives_to_process
+                    num_archives_to_process_margin_m = num_archives_to_process 
                 effective_margin_m = math.exp(args.processed_archives * math.log(args.final_margin_m / args.initial_margin_m)
                                               / num_archives_to_process_margin_m) * args.initial_margin_m
-            ddp_model.module.metric.m = effective_margin_m
+            model.metric.m = effective_margin_m
 
-        coeff = world_size
-        if _iter < args.warmup_epochs > 0 and world_size > 1:
-            coeff = float(_iter) * (world_size - 1) / args.warmup_epochs + 1.0
+        coeff = num_jobs
+        if _iter < args.warmup_epochs > 0 and num_jobs > 1:
+            coeff = float(_iter) * (num_jobs - 1) / args.warmup_epochs + 1.0
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = effective_learning_rate * coeff
-        #TODO
 
-        if rank == 0:
+        if hvd.rank() == 0:
             lr = optimizer.param_groups[0]['lr']
 
             if args.metric == 'linear':
@@ -537,7 +549,7 @@ def train(rank, world_size, args):
                             f'  ({percent:0.1f}% complete)  lr: {lr:0.5f}')
             else:
                 logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
-                            f'  ({percent:0.1f}% complete)  lr: {lr:0.5f} margin: {ddp_model.module.metric.m:0.4f}')
+                            f'  ({percent:0.1f}% complete)  lr: {lr:0.5f} margin: {model.metric.m:0.4f}')
 
         train_dataset.set_iteration(_iter + 1)
 
@@ -545,46 +557,41 @@ def train(rank, world_size, args):
             args=args,
             main_dir=args.dir,
             _iter=_iter + 1,
-            model=ddp_model,
+            model=model,
             data_loader=train_loader,
             optimizer=optimizer,
             criterion=criterion,
-            device=None,
+            device=device,
             log_interval=500,
-            len_train_sampler=len(train_sampler),
-            world_size=world_size,
-            rank=rank)
+            len_train_sampler=len(train_sampler))
 
-        if args.cleanup and rank == 0:
+        if args.cleanup and hvd.rank() == 0:
             # do a clean up everything but the last 2 models, under certain conditions
             _remove_model(args.dir, _iter - 2, args.preserve_model_interval)
 
-    if rank == 0:
+    if hvd.rank() == 0:
         ze_utils.force_symlink(f'raw_{num_iters}.pth', os.path.join(args.dir, 'models', 'model_final'))
 
-    if args.cleanup and rank == 0:
+    if args.cleanup and hvd.rank() == 0:
         logger.info(f'Cleaning up the experiment directory {args.dir}')
         for _iter in range(num_iters - 2):
             _remove_model(args.dir, _iter, args.preserve_model_interval)
 
 
 if __name__ == '__main__':
-
     args = get_args()
 
     assert os.path.isdir(args.egs_dir), f'egs directory `{args.egs_dir}` does not exist.'
 
     try:
-        world_size = args.gpu_num
-        mp.spawn(train, args=(world_size,args), nprocs=world_size, join=True)
+        train(args)
         ze_utils.wait_for_background_commands()
     except BaseException as e:
         # look for BaseException so we catch KeyboardInterrupt, which is
         # what we get when a background thread dies.
         if not isinstance(e, KeyboardInterrupt):
             traceback.print_exc()
-        # if os.path.exists('using_gpus.txt') and hvd.rank() == 0
-        if os.path.exists('using_gpus.txt'):
+        if os.path.exists('using_gpus.txt') and hvd.rank() == 0:
             logger.info('Removing using_gpus.txt file')
             os.remove('using_gpus.txt')
         sys.exit(1)

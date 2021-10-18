@@ -189,7 +189,10 @@ def get_random_chunk_without_replacement(spk, spk2chunk, spk2utt, utt2len, spk2s
             # first shuffle the chunks.
             random.shuffle(chunks)
             spk2chunk[spk] = chunks
-    i = random.randint(0, spk_num_chunks - 1)
+    if spk_num_chunks == 1:
+        i = 0
+    else:
+        i = random.randint(0, spk_num_chunks - 1)
     chunk = spk_chunks.pop(i)
     return chunk
 
@@ -264,6 +267,8 @@ def splitting(args, spk2utt, utt2spk, utt2len, prefix):
     archive_index = 1
     this_num_egs = args.num_repeats * len(spk2chunks)
     all_arks_num_egs = set()
+
+    debug_count = 0
     while True:
         print("Processing archive {0}".format(archive_index))
         print("{0} {1}".format(archive_index, frames_per_chunk), file=info_f)
@@ -275,6 +280,8 @@ def splitting(args, spk2utt, utt2spk, utt2len, prefix):
         #     for spk in _speakers:
         #         speakers += [spk] * args.num_repeats
         # else:
+
+        debug_count = debug_count + 1
         speakers = args.num_repeats * list(spk2chunks.keys())
         random.shuffle(speakers)
         ark_num_egs = 0
@@ -293,6 +300,9 @@ def splitting(args, spk2utt, utt2spk, utt2len, prefix):
                     if archive_index > 85:
                         print(exp)
                     pass
+            # spk = speakers.pop()
+            # chunk = get_random_chunk_without_replacement(spk, spk2chunks, spk2utt, utt2len, spk2start_idx,
+            #                                              frames_per_chunk)
             this_egs.append(chunk)
             spk2used_chunks[spk] += 1
             ark_num_egs += 1

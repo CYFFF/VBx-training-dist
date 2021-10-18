@@ -12,6 +12,7 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 import onnxruntime
+import collections
 
 from models.resnet2 import ResNet34, ResNet18, ResNet101
 
@@ -74,7 +75,10 @@ if __name__ == '__main__':
     model = ResNet101(feat_dim, embed_dim)
     metric_fc = AddMarginProduct(embed_dim, num_targets, s=32, m=0.2)
     model.add_module('metric', metric_fc)
-    state_dict = torch.load(args.input, map_location='cpu')['state_dict']
+    state_dict_tmp = torch.load(args.input, map_location='cpu')['state_dict']
+
+    state_dict = collections.OrderedDict([(k[7:], v) for k, v in state_dict_tmp.items()])
+
     del state_dict['metric.weight']
     
     if not args.use_whole_net:
@@ -89,6 +93,7 @@ if __name__ == '__main__':
         if 'metric.0.running_var' in state_dict.keys():
             del state_dict['metric.0.running_var']
         if 'metric.0.num_batches_tracked' in state_dict.keys():
+
             del state_dict['metric.0.num_batches_tracked']
         if 'metric.2.weight' in state_dict.keys():
             del state_dict['metric.2.weight']

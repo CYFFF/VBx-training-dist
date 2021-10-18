@@ -8,7 +8,7 @@
 # All Rights Reserved
 
 nnet_dir=exp/xvector_nnet
-stage=0
+stage=6
 train_stage=-1
 
 . ./cmd.sh || exit 1
@@ -25,9 +25,9 @@ rate=16k
 all_data_dir=all_combined
 
 # set directory for corresponding datasets
-voxceleb1_path=
-voxceleb2_dev_path=
-voxceleb_cn_path=
+voxceleb1_path=/home/chenyifan/Datasets_2/voxceleb1/dev/wav/
+voxceleb2_dev_path=/home/chenyifan/Datasets_2/voxceleb2/dev/aac
+voxceleb_cn_path=/home/chenyifan/Datasets_2/cnceleb/cnceleb-merge/data
 
 
 if [ ${stage} -le 1 ]; then
@@ -56,17 +56,17 @@ if [ ${stage} -le 2 ]; then
   # in this stage, we compute VAD and prepare features for both clean and augmented audio
 
   # make mfccs from clean audios (will be only used to compute vad afterwards)
-  steps/make_mfcc.sh --write-utt2num-frames true --mfcc-config conf/mfcc_${rate}.conf --nj 500 --cmd \
+  steps/make_mfcc.sh --write-utt2num-frames true --mfcc-config conf/mfcc_${rate}.conf --nj 50 --cmd \
     "${feats_cmd}" data/${all_data_dir} exp/make_fbank ${mfccdir}
   utils/fix_data_dir.sh data/${all_data_dir}
 
   # compute VAD for clean audio
-  local/compute_vad_decision.sh --nj 500 --cmd \
+  local/compute_vad_decision.sh --nj 50 --cmd \
     "${vad_cmd}" data/${all_data_dir} exp/make_vad ${vaddir}
   utils/fix_data_dir.sh data/${all_data_dir}
 
   # make fbanks from clean audios
-  steps/make_fbank.sh --write-utt2num-frames true --fbank-config conf/fbank_${rate}.conf --nj 500 --cmd \
+  steps/make_fbank.sh --write-utt2num-frames true --fbank-config conf/fbank_${rate}.conf --nj 50 --cmd \
     "${feats_cmd}" data/${all_data_dir} exp/make_fbank ${fbankdir}
   utils/fix_data_dir.sh data/${all_data_dir}
   
@@ -74,13 +74,12 @@ if [ ${stage} -le 2 ]; then
   utils/augment_data_dir.sh ${all_data_dir}
   
   # extract features from augmented data
-  steps/make_fbank.sh --write-utt2num-frames true --fbank-config conf/fbank_${rate}.conf --nj 500 --cmd \
+  steps/make_fbank.sh --write-utt2num-frames true --fbank-config conf/fbank_${rate}.conf --nj 50 --cmd \
     "${feats_cmd}" data/${all_data_dir}_aug exp/make_fbank ${fbankdir}
   utils/fix_data_dir.sh data/${all_data_dir}_aug
 
   utils/combine_data.sh data/${all_data_dir}_aug_and_clean data/${all_data_dir}_aug data/${all_data_dir}
 fi
-
 
 name=${all_data_dir}_aug_and_clean
 if [ ${stage} -le 3 ]; then
@@ -88,7 +87,7 @@ if [ ${stage} -le 3 ]; then
   # This script applies CMVN and removes nonspeech frames.  Note that this is somewhat
   # wasteful, as it roughly doubles the amount of training data on disk.  After
   # creating training examples, this can be removed.
-  local/nnet3/xvector/prepare_feats_for_egs.sh --nj 100 --cmd "${train_cmd}" \
+  local/nnet3/xvector/prepare_feats_for_egs.sh --nj 20 --cmd "${train_cmd}" \
     data/${name} data/${name}_with_aug_no_sil exp/${name}_with_aug_no_sil
   utils/fix_data_dir.sh data/${name}_with_aug_no_sil
 
@@ -115,12 +114,11 @@ if [ ${stage} -le 3 ]; then
   utils/fix_data_dir.sh data/${name}_with_aug_no_sil
 fi
 
-
 if [ ${stage} -le 4 ]; then
   echo "$0: Getting neural network training egs";
   local/nnet3/xvector/get_egs_but.sh --cmd "$train_cmd" \
-    --nj 16 \
-    --stage 0 \
+    --nj 32 \
+    --stage 3 \
     --frames-per-chunk 400 \
     --not-used-frames-percentage 40 \
     --num-archives 1000 \
@@ -128,18 +126,18 @@ if [ ${stage} -le 4 ]; then
     --num-repeats 10 \
     data/${name}_with_aug_no_sil exp/egs
 fi
+# exit
 
-num_gpus=2
+num_gpus=3
 if [ ${stage} -le 5 ]; then
   # set all needed parameters in train.sh script
   # this will start NN training
-  ./train.sh /media/ssd-local/profant/exp/egs exp/nnet
+  # ./train.sh /home/chenyifan/repos/VBx-training/exp/egs exp/nnet
 
   # convert pytoch model to onnx (much faster)
   # if this end with error it should be fine, just check if onnx file is present
   python local/convert_resnet2onnx.py -i exp/nnet/ResNet101_add_margin_embed256_${num_gpus}gpu/models/model_final -o exp/nnet/ResNet101_add_margin_embed256_${num_gpus}gpu/models/model_final.onnx
 fi
-
 
 if [ ${stage} -le 6 ]; then
   # create data directory for training of PLDA
@@ -165,6 +163,7 @@ if [ ${stage} -le 6 ]; then
   wait
 fi
 
+exit
 
 if [ ${stage} -le 7 ]; then
   # train PLDA

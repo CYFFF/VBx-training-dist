@@ -13,8 +13,10 @@ fi
 egs_dir=$1
 out_dir=$2
 
-AVAIL_GPUS=$(local/utils/free-gpus.sh)
-ngpus=2
+#AVAIL_GPUS=$(local/utils/free-gpus.sh)
+AVAIL_GPUS=0,1,2
+CUDA_VISIBLE_DEVICES=AVAIL_GPUS
+ngpus=3
 
 # linear | arc_margin | sphere |add_margin
 metric="add_margin"
@@ -24,32 +26,33 @@ embed_dim=256
 export CUDA_VISIBLE_DEVICES=${AVAIL_GPUS:0:$((${ngpus}*2-1))}
 
 # horovod stuff
-export NCCL_SOCKET_IFNAME=bond0.6
-export CUDA_LAUNCH_BLOCKING=1
-export HOROVOD_GPU_ALLREDUCE=NCCL
+# export NCCL_SOCKET_IFNAME=bond0.6
+# export CUDA_LAUNCH_BLOCKING=1
+# export HOROVOD_GPU_ALLREDUCE=NCCL
 
 . ./path.sh
 
 
 # final model trained using 6x RTX 2080Ti, modify batchsize accordingly
-horovodrun -np ${ngpus} --mpi --autotune \
-    python local/train_pytorch_dnn.py --model ${model} \
-        --num-targets 8178 \
-        --dir ${out_dir}/${model}_${metric}_embed${embed_dim}_${ngpus}gpu \
-        --metric ${metric} \
-        --egs-dir ${egs_dir} \
-        --minibatch-size 12 \
-        --embed-dim ${embed_dim} \
-        --warmup-epochs 0 \
-        --initial-effective-lrate 0.01 \
-        --final-effective-lrate 0.00005 \
-        --initial-margin-m 0.05 \
-        --final-margin-m 0.2 \
-        --optimizer SGD \
-        --momentum 0.9 \
-        --optimizer-weight-decay 0.0001 \
-        --preserve-model-interval 30 \
-        --num-epochs 3 \
-        --apply-cmn no \
-        --fix-margin-m 2
+# horovodrun -np ${ngpus} --mpi --autotune \
+python local/train_pytorch_dnn.py --model ${model} \
+    --num-targets 10198 \
+    --dir ${out_dir}/${model}_${metric}_embed${embed_dim}_${ngpus}gpu \
+    --metric ${metric} \
+    --egs-dir ${egs_dir} \
+    --minibatch-size 12 \
+    --embed-dim ${embed_dim} \
+    --warmup-epochs 0 \
+    --initial-effective-lrate 0.01 \
+    --final-effective-lrate 0.00005 \
+    --initial-margin-m 0.05 \
+    --final-margin-m 0.2 \
+    --optimizer SGD \
+    --momentum 0.9 \
+    --optimizer-weight-decay 0.0001 \
+    --preserve-model-interval 30 \
+    --num-epochs 3 \
+    --apply-cmn no \
+    --fix-margin-m 2 \
+    --gpu-num ${ngpus}
 

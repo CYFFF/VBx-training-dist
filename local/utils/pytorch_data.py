@@ -155,7 +155,7 @@ class KaldiArkLoader(object):
         cmn_command = ""
         if self._apply_cmn:
             cmn_command = " | apply-cmvn-sliding --norm-vars=false --center=true --cmn-window=300 ark:- ark:-"
-        cmd = "nnet3-copy-egs-to-feats --print-args=false ark:{} ark:-{}".format(self._ark_file, cmn_command)
+        cmd = "/opt/kaldi/src/nnet3bin/nnet3-copy-egs-to-feats --print-args=false ark:{} ark:-{}".format(self._ark_file, cmn_command)
         fh = open("/dev/null", "w")
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=fh)
         cleanup_thread = Thread(target=cleanup, args=(process, cmd))
