@@ -1,4 +1,10 @@
-# VBx-training-recipe
+# VBx-Training-Dist
+
+The original repository [VBx-training-recipe](https://github.com/phonexiaresearch/VBx-training-recipe) use [Horovod](https://github.com/horovod/horovod) to conduct parallel training. However, Horovod has some problems. In this repository, Horovod is replaced by [Pytorch Distributed Framework](https://pytorch.org/docs/stable/distributed.html), which is more effcient.
+
+# README of [Original Repository](https://github.com/phonexiaresearch/VBx-training-recipe)
+
+## VBx-training-recipe
 Training recipe for VBx repository. For results and more info please see [VBx](https://github.com/BUTSpeechFIT/VBx).
 
 ## Installation
